@@ -1,16 +1,25 @@
 #!/usr/bin/env groovy
 /**
- * Kafka 0.8.1.1
- * --- Rebalance partitions across the kafka cluster
- * @author Florian Dambrine
+ * ### KafkaManualPartitionRebalancer.groovy - Kafka 0.8.1.1 ###
+ *
+ * --- Rebalance partitions across a Kafka cluster
+ * The script is based on parsing a current partition plan generated
+ * by the Kafka reassignment partition tool. The script parses this plan
+ * And rebalance partitions across the entire cluster taking in account
+ * the leadership balancing.
+ * 
+ * @author Florian Dambrine (android.florian@gmail.com)
+ * @date 2014/07/01
+ *
  */
 
 @Grapes([
     @GrabConfig(systemClassLoader = true)
 ])
 
-
 package com.gumgum.kafka
+
+import com.gumgum.util.Logger
 
 import org.apache.commons.cli.*
 
@@ -19,21 +28,25 @@ import groovy.json.JsonBuilder
 
 import java.lang.System
 
-import com.gumgum.util.Logger
-
 LOGGER = new Logger(clazz:this.getClass())
 
 //////////////////////////////////////////////////////////////////////
 // Classes
 //////////////////////////////////////////////////////////////////////
 
+
 /**
- *
+ * Object representation for a Kafka cluster.
 */
 class PartitionAnalyzer {
 	private static final PartitionAnalyzer instance = new PartitionAnalyzer()
 	private List<Broker> brokerList
 
+	/**
+	 * ***TODO**
+	 * For the moment the @brokerList is static. 
+	 * Thinking about generating this list dynamically.
+	**/
 	private PartitionAnalyzer() {
 		//EC2 construct the bk list
 		this.brokerList = [
@@ -53,10 +66,16 @@ class PartitionAnalyzer {
 		return instance
 	}
 
+	/**
+	 * Return the broker list.
+	**/
 	public List<Broker> getBrokerList() {
 		return this.brokerList
 	}
 
+	/**
+	 * Return the total number of partitions contained in the cluster.
+	**/
 	public Integer getClusterOwnedPartitionNumber() {
 		Integer clusterOwnedPartitionNumber = 0
 		brokerList.each { broker ->
@@ -65,6 +84,9 @@ class PartitionAnalyzer {
 		clusterOwnedPartitionNumber
 	}
 
+	/**
+	 * Gets the number of topics existing in the cluster
+	**/
 	public Integer getClusterOwnedTopicNumber() {
 		Integer clusterOwnedTopicNumber = 0
 		brokerList.each { broker ->
@@ -75,6 +97,9 @@ class PartitionAnalyzer {
 		clusterOwnedTopicNumber
 	}
 
+	/**
+	 * Returns the broker object matching the @brokerId param
+	**/
 	public Broker searchBroker(String brokerId) {
 		Broker searchBk = null
 		this.brokerList.each { bk ->
@@ -107,7 +132,7 @@ class PartitionAnalyzer {
 	}
 
 	/**
-	 * Return the number of partitions for which the broker is the leader
+	 * Returns the number of partitions for the topic @topicName for which the broker @brokerId is the leader.
 	**/
 	public Integer getPartitionLeaderCount(String brokerId, String topicName) {
 		Integer leaderCount = 0
@@ -129,7 +154,7 @@ class PartitionAnalyzer {
 }
 
 /**
- *
+ * Object representation for a Kafka broker.
 */
 class Broker {
 	private String brokerId
@@ -144,6 +169,9 @@ class Broker {
 		this.topicList = []
 	}
 
+	/**
+	 * Adds a topic with its partitions and its replica list to the broker.
+	**/
 	public void addTopicWithPartitionsAndReplicas (String topicName, String partitionName, List replicaList) {
 		if (!this.topicExists(topicName)) {
 			this.topicList << new Topic(topicName, partitionName, replicaList)
@@ -152,6 +180,9 @@ class Broker {
 		}
 	}
 
+	/**
+	 * Tests if the topic @topicName exists. Returns true if it is the casem otherwise false.
+	**/	 
 	public Boolean topicExists (String topicName) {
 		Boolean found = false
 		this.topicList.each { t ->
@@ -162,6 +193,9 @@ class Broker {
 		found
 	}
 
+	/**
+	 * Returns the topic @topicName
+	**/
 	public Topic getTopic (String topicName) {
 		Topic topic = null
 		this.topicList.each { t ->
@@ -172,6 +206,9 @@ class Broker {
 		topic
 	}
 
+	/**
+	 * Returns the number of partitions owned by this broker.
+	**/
 	public Integer getOwnedPartitionNumber() {
 		Integer ownedPartitionNumber = 0
 		topicList.each { topic ->
@@ -206,7 +243,7 @@ class Broker {
 
 
 /**
- *
+ * Object representation for a Kafka topic.
 */
 class Topic {
 	private String topicName
@@ -220,18 +257,28 @@ class Topic {
 		this.partitionList << new Partition(partition, replicaList)
 	}
 
+	/**
+	 * Adds a new partition @partition with its replica list @replicaList to the topic.
+	**/
 	public void addPartition(String partition, List replicaList) {
 		this.partitionList << new Partition(partition, replicaList)
 		this.partitionList = this.partitionList.sort { it.partitionNum }
 	}
 
+	/**
+	 * Return the partition @partitionNum
+ 	**/
 	public Partition getPartition(String partitionNum) {
 		this.partitionList.find { it.partitionNum == partitionNum }
 	}
 
 	/**
-	 * true: Extract leader partitions
-	 * false: Extract replica partitions
+	 * Retrieves the list of partitions in which the Broker @brokerId is present.
+	 * If @leaderPartitions equals true, then only partitions where the broker @brokerId is leader
+	 * are returned. If @leaderPartitions equals false, then the methods search only partitions
+	 * for which the broker @brokerId is replica.
+	 *
+	 * @param leaderPartitions: If true, extracts leader partitions, otherwise extracts replica partitions
 	**/
 	private List<Partition> extractSubPartitionList(String brokerId, Boolean leaderPartitions) {
 		List<Partition> subPartitionList = []
@@ -264,6 +311,11 @@ class Topic {
 		subPartitionList
 	}
 
+	/**
+	 * Entire logic of paritition relocation. The method finds the best destination
+	 * broker to relocate a partition. The relocation takes in account the average number 
+	 * of partitions owned by each broker and also the leadership of each broker.
+	**/
 	public void relocatePartitions(Broker brokerSrc, Integer partitionAvg) {
 		PartitionAnalyzer pa = PartitionAnalyzer.getInstance()
 		//Number of partitions owned by the broker source
@@ -358,16 +410,25 @@ class Topic {
 		}
 	}
 
+	/**
+	 * Adds the partition @partitionNum to the list of partitions locked.
+	**/
 	public void lockPartition(String partitionNum) {
 		if (!this.partitionLock.contains(partitionNum)){
 			this.partitionLock << partitionNum
 		}
 	}
 
+	/**
+	 * Returns true if the partition @partitionNum is locked.
+	**/ 
 	public Boolean isLockedPartition(String partitionNum) {
 		this.partitionLock.contains(partitionNum)
 	}
 
+	/**
+	 * Clear partitions locked.
+	**/
 	public void clearPartitionLock() {
 		this.partitionLock.clear()
 	}
@@ -390,7 +451,7 @@ class Topic {
 
 
 /**
- *
+ * Object representation of a Kafka partition.
 */
 class Partition {
 	private String partitionNum
@@ -408,6 +469,11 @@ class Partition {
 		}
 	}
 
+	/**
+	 * Calculates an average that helps to decide if this partition
+	 * can be moved without unbalancing an other broker.
+	 * An high average means that the leadership broker average is high.
+	**/
 	public calculateBrokerDependencies(String topicName) {
 		PartitionAnalyzer pa = PartitionAnalyzer.getInstance()
 		Integer avg = 0
@@ -440,7 +506,7 @@ class Partition {
 }
 
 /**
- *
+ * Object representation of a Kafka replica.
 */
 class Replica {
 	private Broker broker
@@ -451,10 +517,17 @@ class Replica {
 		this.isReassigned = false
 	}
 
+	/**
+	 * Is reassigned is switched to true when the replica has been moved from
+	 * one broker to another.
+	**/
 	public void setIsReassigned(Boolean isReassigned) {
 		this.isReassigned = isReassigned
 	}	
 
+	/**
+	 * The a new broker for this replica.
+	**/
 	public void setBroker(Broker newBroker) {
 		this.broker = newBroker
 	}
@@ -606,7 +679,6 @@ LOGGER.logIfThrows {
 	 		listCurrentPartitionAssignment()
 		}
 	}
-
 	if ('GENERATE_JSON' in ACTIONS) {
 		generateJsonFile()
 	}
@@ -614,10 +686,12 @@ LOGGER.logIfThrows {
 
 
 def usage() {
-    LOGGER.error("Usage: com.gumgum.kafka.KafkaPartitionAnalyzer.groovy --inputJson JSON_INPUT_PATH [--topicFilter] [--partitionFilter] --list|--rebalance|--generate-json JSON_OUTPUT_PATH")
+    LOGGER.error("Usage: com.gumgum.kafka.KafkaManualPartitionRebalancer.groovy --inputJson JSON_INPUT_PATH [--topicFilter] [--partitionFilter] --list|--rebalance|--generate-json JSON_OUTPUT_PATH")
 }
 
-
+/**
+ * Displays a tree architecture of the Kafka cluster.
+**/
 def listCurrentPartitionAssignment() {
 	PartitionAnalyzer pa = PartitionAnalyzer.getInstance()
 	List<Broker> brokerList = pa.getBrokerList()
@@ -646,6 +720,9 @@ def listCurrentPartitionAssignment() {
 	}
 }
 
+/**
+ * Calculate a new reassignment plan limiting the number of partition moves.
+**/
 def generateNewPartitionAssignment() {
 	PartitionAnalyzer pa = PartitionAnalyzer.getInstance()
 	
@@ -673,6 +750,9 @@ def generateNewPartitionAssignment() {
 	}
 }
 
+/**
+ * Generates the JSON repartition plan (topics-to-move-json-file).
+**/
 def generateJsonFile() {
 	def partitions = [:]
 
